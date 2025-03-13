@@ -20,8 +20,8 @@ class QubicRpcClient {
       transactions: {}, // Cache for transaction data by tick
     };
     
-    // Safety buffer for latest block (how many blocks to go back from absolute latest)
-    this.LATEST_BLOCK_SAFETY_BUFFER = 10;
+    // Safety buffer for latest block (reduced from 10 to 5)
+    this.LATEST_BLOCK_SAFETY_BUFFER = 5;
     
     // Use 10000 as default page size for performance
     this.DEFAULT_PAGE_SIZE = 10000;
@@ -250,6 +250,10 @@ class QubicRpcClient {
   // As per spec: "must return a block only when all events have been processed"
   async getLatestTick() {
     try {
+      // RESET any cached data for status to ensure fresh results
+      this.cache.status = null;
+      this.cache.statusTimestamp = 0;
+      
       // First get latest tick number from API
       const response = await this.handleRequest('/v1/latestTick');
       
@@ -262,22 +266,72 @@ class QubicRpcClient {
         const safeTickNumber = Math.max(0, latestTickNumber - this.LATEST_BLOCK_SAFETY_BUFFER);
         console.log(`Using safe tick number with buffer: ${safeTickNumber}`);
         
+        // Instead of relying on cached data, try to directly fetch this tick
+        try {
+          console.log(`Attempting direct fetch of tick ${safeTickNumber}`);
+          const directTickResponse = await this.handleRequest(`/v2/ticks/${safeTickNumber}`);
+          
+          if (directTickResponse) {
+            const safeTickData = this.normalizeTickData(directTickResponse);
+            console.log(`Successfully fetched tick ${safeTickNumber} directly`);
+            
+            // Verify transaction data is available
+            try {
+              // Just check if the transactions endpoint is accessible
+              await this.client.get(`/v2/ticks/${safeTickNumber}/transactions`, {
+                params: { page: 0, pageSize: 1 }
+              });
+              console.log(`Verified transaction data availability for tick ${safeTickNumber}`);
+              return safeTickData;
+            } catch (txError) {
+              console.warn(`Tick ${safeTickNumber} has inaccessible transaction data: ${txError.message}`);
+              // Continue to fallback methods
+            }
+          }
+        } catch (directError) {
+          console.warn(`Direct tick fetch failed: ${directError.message}`);
+          // Continue to fallback methods
+        }
+        
         // Get current epoch
         const currentEpoch = await this.getCurrentEpoch();
         
-        // Instead of fetching ALL ticks in the current epoch, just fetch the most recent ones
-        // We'll use a smaller page size and limit pages to ensure fast response
-        const RECENT_TICKS_MAX = 200; // Only get the most recent 200 ticks max
-        const MAX_PAGES = 2; // Only check up to 2 pages
+        // Try a different approach - get the status which includes lastProcessedTick
+        try {
+          const statusResponse = await this.handleRequest('/v1/status');
+          if (statusResponse && statusResponse.lastProcessedTick && statusResponse.lastProcessedTick.tickNumber) {
+            const lastProcessedTickNumber = statusResponse.lastProcessedTick.tickNumber;
+            console.log(`Last processed tick from status: ${lastProcessedTickNumber}`);
+            
+            // Use the last processed tick, which should be safe
+            const statusTickData = {
+              tickNumber: lastProcessedTickNumber,
+              timestamp: Date.now(),
+              epoch: statusResponse.lastProcessedTick.epoch || currentEpoch
+            };
+            
+            // Check if it's at least within a reasonable range of our safe tick
+            if (Math.abs(lastProcessedTickNumber - safeTickNumber) < 1000) {
+              console.log(`Using last processed tick from status: ${lastProcessedTickNumber}`);
+              return statusTickData;
+            } else {
+              console.warn(`Last processed tick ${lastProcessedTickNumber} too far from safe tick ${safeTickNumber}`);
+              // Continue to fallback methods
+            }
+          }
+        } catch (statusError) {
+          console.warn(`Status fetch failed: ${statusError.message}`);
+          // Continue to fallback methods
+        }
         
-        let recentTicks = [];
+        // Fallback to epoch-based search
         const pageSize = 10000; // INCREASED from 500 to 10000 for better performance
         
-        // Try to get specifically the page that might contain our tick
+        // Calculate the page more precisely for the safe tick number
         const estimatedPage = Math.floor(safeTickNumber / pageSize);
-        console.log(`Getting recent ticks from epoch ${currentEpoch}, estimated page: ${estimatedPage}`);
+        console.log(`Fetching from epoch ${currentEpoch}, estimated page: ${estimatedPage}`);
         
-        // Try with a direct request to the estimated page first
+        // Get ticks from this page
         try {
           const ticksResponse = await this.handleRequest(
             `/v2/epochs/${currentEpoch}/ticks`,
@@ -285,114 +339,62 @@ class QubicRpcClient {
           );
           
           if (ticksResponse && ticksResponse.ticks && Array.isArray(ticksResponse.ticks)) {
+            // Find our target tick or closest one
+            let targetTick = null;
+            let closestOlderTick = null;
+            let smallestDiff = Infinity;
+            
             for (const tick of ticksResponse.ticks) {
-              // Normalize and cache individual ticks
               const tickNumber = tick.tickNumber || tick.number;
-              this.cache.ticks[tickNumber] = this.normalizeTickData(tick);
-              recentTicks.push(this.cache.ticks[tickNumber]);
+              
+              // Exact match
+              if (tickNumber === safeTickNumber) {
+                targetTick = this.normalizeTickData(tick);
+                break;
+              }
+              
+              // Find closest older tick
+              if (tickNumber <= safeTickNumber && safeTickNumber - tickNumber < smallestDiff) {
+                closestOlderTick = this.normalizeTickData(tick);
+                smallestDiff = safeTickNumber - tickNumber;
+              }
+            }
+            
+            // If we found the exact tick, use it
+            if (targetTick) {
+              console.log(`Found exact safe tick ${targetTick.tickNumber}`);
+              return targetTick;
+            }
+            
+            // If we found a close older tick, use it
+            if (closestOlderTick) {
+              console.log(`Using closest older tick ${closestOlderTick.tickNumber}`);
+              return closestOlderTick;
             }
           }
         } catch (error) {
-          console.warn(`Error fetching estimated page ${estimatedPage}, will try with recent pages`);
+          console.warn(`Error fetching estimated page ${estimatedPage}: ${error.message}`);
         }
         
-        // If we couldn't find the tick in the estimated page, try the most recent pages
-        if (!recentTicks.find(t => t.tickNumber === safeTickNumber)) {
-          // Get most recent pages
-          for (let page = 0; page < MAX_PAGES; page++) {
-            if (recentTicks.length >= RECENT_TICKS_MAX) break;
-            
-            try {
-              console.log(`Fetching epoch ${currentEpoch} page ${page} for recent ticks`);
-              const ticksResponse = await this.handleRequest(
-                `/v2/epochs/${currentEpoch}/ticks`,
-                { page, pageSize }
-              );
-              
-              if (ticksResponse && ticksResponse.ticks && Array.isArray(ticksResponse.ticks)) {
-                for (const tick of ticksResponse.ticks) {
-                  // Normalize and cache individual ticks
-                  const tickNumber = tick.tickNumber || tick.number;
-                  this.cache.ticks[tickNumber] = this.normalizeTickData(tick);
-                  recentTicks.push(this.cache.ticks[tickNumber]);
-                  
-                  if (recentTicks.length >= RECENT_TICKS_MAX) break;
-                }
-              } else {
-                break; // No more ticks
-              }
-            } catch (error) {
-              console.error(`Error getting ticks for epoch ${currentEpoch} page ${page}:`, error.message);
-              break;
-            }
-          }
-        }
-        
-        // Sort by tick number (descending) to find most recent
-        recentTicks.sort((a, b) => b.tickNumber - a.tickNumber);
-        
-        // Try to find the safe tick in the recent ticks
-        let safeTickData = recentTicks.find(t => t.tickNumber === safeTickNumber);
-        
-        // If we can't find the exact tick, return the closest older one
-        if (!safeTickData) {
-          // Find the newest tick that's older than or equal to safeTickNumber
-          const olderTicks = recentTicks.filter(t => t.tickNumber <= safeTickNumber);
-          
-          if (olderTicks.length > 0) {
-            // Already sorted by tick number (descending), so take the first one
-            safeTickData = olderTicks[0];
-            console.log(`Using older tick ${safeTickData.tickNumber} as safe latest tick`);
-          } else if (recentTicks.length > 0) {
-            // If no older ticks, use the oldest of recent ticks
-            safeTickData = recentTicks[recentTicks.length - 1];
-            console.log(`No older ticks found, using oldest recent tick ${safeTickData.tickNumber}`);
-          } else {
-            // If no ticks at all, try previous epoch
-            const prevEpoch = currentEpoch - 1;
-            console.log(`No ticks found in current epoch, trying previous epoch ${prevEpoch}`);
-            
-            try {
-              // Just get a single page from previous epoch
-              const prevEpochResponse = await this.handleRequest(
-                `/v2/epochs/${prevEpoch}/ticks`,
-                { page: 0, pageSize }
-              );
-              
-              if (prevEpochResponse && prevEpochResponse.ticks && Array.isArray(prevEpochResponse.ticks) && prevEpochResponse.ticks.length > 0) {
-                // Use the newest tick from previous epoch
-                const newestTick = prevEpochResponse.ticks.sort((a, b) => {
-                  return (b.tickNumber || b.number) - (a.tickNumber || a.number);
-                })[0];
-                
-                safeTickData = this.normalizeTickData(newestTick);
-                console.log(`Using tick ${safeTickData.tickNumber} from previous epoch ${prevEpoch}`);
-              }
-            } catch (error) {
-              console.error(`Error getting ticks from previous epoch ${prevEpoch}:`, error.message);
-            }
-          }
-        }
-        
-        if (safeTickData) {
-          console.log(`Found safe latest tick ${safeTickData.tickNumber}`);
-          return safeTickData;
-        }
-        
-        // If we couldn't find a good tick, return basic info
+        // Last resort - just return basic info with the calculated safe tick number
         console.warn(`Could not find tick data, returning basic info for tick ${safeTickNumber}`);
         return { 
           tickNumber: safeTickNumber, 
-          timestamp: Date.now(), 
+          timestamp: Math.floor(Date.now() / 1000), // Use seconds for timestamp
           epoch: currentEpoch
         };
       }
       
       console.warn('Failed to get latest tick number from Qubic RPC, returning placeholder');
-      return { tickNumber: 0, timestamp: Date.now() };
+      return { tickNumber: 0, timestamp: Math.floor(Date.now() / 1000) };
     } catch (error) {
-      console.error('Error fetching latest tick:', error.message);
-      return { tickNumber: 0, timestamp: Date.now(), error: error.message };
+      console.error('Error in getLatestTick:', error.message);
+      // Return a valid placeholder that won't break DEXTools
+      return { 
+        tickNumber: 0, 
+        timestamp: Math.floor(Date.now() / 1000),
+        error: 'Failed to retrieve latest tick'
+      };
     }
   }
 

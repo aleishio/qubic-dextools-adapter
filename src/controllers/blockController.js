@@ -48,7 +48,7 @@ class BlockController {
         console.log(`Verified transaction data availability for tick ${latestValidTick.tickNumber}`);
       } catch (error) {
         // If we can't access transaction data for this tick, it's not safe to return it as the latest block
-        console.error(`Cannot get transaction data for tick ${latestValidTick.tickNumber}, finding earlier tick`);
+        console.error(`Cannot get transaction data for tick ${latestValidTick.tickNumber}, finding earlier tick: ${error.message}`);
         
         // Get a different tick that's definitely fully processed
         const saferTicks = await qubicRpcClient.getRecentValidTicks(5);
