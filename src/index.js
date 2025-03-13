@@ -4,8 +4,6 @@ const config = require('./config');
 // Start server
 const server = app.listen(config.port, () => {
   console.log(`DEXTools Adapter for Qubic running on port ${config.port} in ${config.nodeEnv} mode`);
-  console.log(`Using Archive RPC: ${config.qubic.archiveRpcUrl}`);
-  console.log(`Using Live RPC: ${config.qubic.liveRpcUrl}`);
 });
 
 // Handle graceful shutdown
