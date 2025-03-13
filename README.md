@@ -41,27 +41,9 @@ Development mode (with auto-restart):
 npm run dev
 ```
 
-### Testing the Adapter
+## DEXTools HTTP API Implementation
 
-Test the Qubic RPC connection:
-```
-npm run test:rpc
-```
-
-Test the complete adapter functionality:
-```
-npm test
-```
-
-## DEXTools HTTP API Specification
-
-The `http-adapter` directory contains the OpenAPI specification for the DEXTools HTTP API. This specification defines the endpoints that any blockchain or DEX must implement to integrate with DEXTools.
-
-For more details, see the [http-adapter/http-adapter-specification.yml](http-adapter/http-adapter-specification.yml) file.
-
-## API Endpoints Implemented
-
-The adapter implements the following endpoints as required by DEXTools:
+The adapter implements the following endpoints as required by the DEXTools HTTP adapter specification:
 
 - `GET /latest-block` - Latest block in the blockchain
 - `GET /block` - Block by number or timestamp
@@ -71,93 +53,71 @@ The adapter implements the following endpoints as required by DEXTools:
 - `GET /pair` - Pair details by id
 - `GET /events` - Events in a block range
 
-### Additional Health Check Endpoints
-
-The adapter also provides health check endpoints to monitor the services:
-
-- `GET /health` - Overall health of all services
-- `GET /health/rpc` - Health of the main Qubic RPC
-- `GET /health/api` - Health of the Qubic API services
-
 ## Implementation Notes
 
-### Qubic Data Structure
-
-This adapter interfaces with Qubic's three main data sources:
-
-1. **Archive Tree**: Historical data for processed ticks and transactions
-2. **Live Tree**: Real-time data for recent ticks and transactions
-3. **Qubic Transfer API**: Asset/token related data (identities, holders, etc.)
-
-All of these services are accessed through the same RPC endpoint with different API paths.
-
-### Qubic RPC Endpoints Used
-
-This adapter uses the Qubic RPC service at https://rpc.qubic.org with the following endpoints:
-
-- `/v1/latestTick` - Get the latest processed tick
-- `/v1/ticks/{tickNumber}` - Get tick data by tick number
-- `/v2/ticks/{tickNumber}/transactions` - Get transactions for a tick
-- `/v1/status` - Get network status
-- `/v2/epochs/{epoch}/ticks` - Get ticks for an epoch
-- `/v1/healthcheck` - Health check for main RPC
-
-### API Endpoints Used
-
-The adapter uses various API endpoints for DEX-related data:
-
-- `/v1/assets/{id}` - Get asset details
-- `/v2/assets/{id}` - Alternative asset endpoint
-- `/v1/assets/{id}/holders` - Get asset holders
-- `/v1/identities/{id}` - Alternative endpoint for asset details
-- `/v1/exchanges/{id}` - Get exchange details
-- `/v1/pairs/{id}` - Get pair details
-
-### Concept Mapping
+### Qubic Data Structure and Mapping to DEXTools
 
 This adapter maps Qubic concepts to DEXTools concepts:
-- Qubic ticks → DEXTools blocks
-- Qubic transactions → DEXTools events
-- Qubic identities → DEXTools assets/tokens
 
-### Handling Qubic Tick Quality Issues
+- **Qubic ticks → DEXTools blocks**: In Qubic, ticks are the fundamental unit of blockchain progression, similar to blocks in other chains
+- **Qubic transactions → DEXTools events**: Transactions in Qubic ticks are transformed into DEXTools event format
+- **Qubic identities → DEXTools assets/tokens**: Qubic identities are mapped to DEXTools assets
 
-Qubic ticks have some important characteristics that impact this adapter:
+### Understanding Qubic's Tick and Epoch Structure
 
-- Ticks last only 1-2 seconds and are processed rapidly
-- Many ticks may be empty or fail (approximately 10% of ticks are valid)
-- Ticks are organized into epochs that change weekly
+Qubic has a unique blockchain structure that requires special handling:
 
-The adapter implements comprehensive strategies to handle these cases:
+1. **Rapid Tick Processing**: 
+   - Ticks in Qubic last only 1-2 seconds and are processed extremely rapidly
+   - This means thousands of ticks are processed each hour, millions per epoch
+   - DEXTools must be able to access all historical ticks without missing any
 
-1. **Valid Tick Detection**:
-   - Only returns ticks that contain valid data and events
-   - For `/latest-block`, ensures we return the most recent valid tick with events
-   - For `/block`, tries to find the closest valid tick if the exact one is empty
+2. **Network Reliability Issues**:
+   - Approximately 10% of individual tick endpoints (/v1/ticks/{tickNumber}) fail or return empty data
+   - Direct tick-by-tick access suffers from inconsistent network reliability
+   - When fetching thousands of ticks sequentially, these failures accumulate and cause significant data gaps
 
-2. **Expanded Scanning**:
-   - When searching for events in a block range, scans a wider range to find valid ticks
-   - Filters results to match the requested range
-   - Ensures no events are missed due to empty ticks
 
-3. **Fallback Mechanisms**:
-   - If a specific tick is not found, tries nearby ticks (previous or next)
-   - For the latest tick, if it's empty, tries up to 5 previous ticks
-   - Implements comprehensive epoch-based scanning for timestamp queries
+3. **Weekly Epoch Changes**:
+   - Ticks are organized into epochs that change weekly
+   - There are currently 152+ historical epochs in the Qubic blockchain
+   - Each epoch can contain millions of ticks
+   - When searching for ticks, the adapter must be able to find them across any epoch
 
-These measures ensure stable operation even with the fast-paced and sometimes unpredictable
-nature of Qubic ticks, while strictly adhering to the DEXTools HTTP adapter specification.
+4. **Critical for DEXTools Indexing**:
+   - The DEXTools specification requires that all events must be available at the time a block is reported
+   - If any events are missed due to tick unavailability, they'll never be indexed by DEXTools
+   - This makes complete historical coverage of all ticks essential
 
-### Data Availability
+### Implementation Strategies
 
-For endpoints where data may not be available through the Qubic API:
-- If asset, exchange, or pair data isn't available, a 404 response is returned
-- Empty collections (like holders with no data) will return empty arrays
-- No mock data is used - the adapter only returns real data from the Qubic API
+The adapter implements comprehensive strategies to ensure complete coverage of Qubic's data:
+
+1. **Epoch-Based Approach**:
+   - Instead of fetching individual ticks, we retrieve ticks in bulk from epoch endpoints
+   - The `/v2/epochs/{epoch}/ticks` endpoint provides much higher reliability than individual tick endpoints
+   - This approach bypasses the ~10% failure rate of individual tick endpoints
+   - Ensures we don't miss any ticks due to network issues or empty responses
+
+2. **Complete Historical Access**:
+   - Retrieves all ticks from any epoch with no artificial limits on tick count
+   - Implements efficient pagination and caching to handle millions of ticks
+   - Uses a progressive epoch search algorithm to find ticks in any of the 152+ historical epochs
+
+2. **DEXTools-Required Safety Measures**:
+   - For `/latest-block`, applies a safety buffer and verifies event availability before returning
+   - For block searches, implements fallbacks to find valid ticks if the specific one is empty
+   - Ensures complete event coverage for any requested block range
+
+3. **Efficient Range Processing**:
+   - When DEXTools requests the `/events` endpoint for a range of blocks, scans all relevant epochs
+   - Returns all events from every valid tick in the requested range
+   - Sorts events by block number and event index as required by the specification
+
+These measures ensure stable operation even with Qubic's unique high-frequency tick structure, while strictly adhering to the DEXTools HTTP adapter specification requirements for data consistency and availability.
 
 ## Troubleshooting
 
 - Verify the RPC endpoint in your .env file
-- Run the RPC test (`npm run test:rpc`) to check API connectivity
 - Check the adapter logs for API connection errors
-- Use the test script to diagnose specific endpoint issues
+- Ensure enough memory is available for processing large tick ranges
