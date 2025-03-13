@@ -94,10 +94,9 @@ Qubic has a unique blockchain structure that requires special handling:
 The adapter implements comprehensive strategies to ensure complete coverage of Qubic's data:
 
 1. **High-Performance API Access**:
-   - Utilizes an optimized page size of 500 (verified to be accepted by the Qubic API)
-   - Reduces API calls by 80% compared to the default page size of 100
-   - Implements extended timeout (30 seconds) for large data requests 
-   - Adds max content length handling (50MB) for processing large responses
+   - **Optimized Page Size**: Uses a page size of 10000 instead of the default 100, retrieving 100x more ticks per request, reducing API calls required by 99%.
+   - **Extended Timeout**: HTTP timeouts increased to 30 seconds to handle larger responses.
+   - **Max Content Length Handling**: Added support for handling large responses with proper content-length detection.
    - Makes API calls more resilient to temporary network issues
 
 2. **Smart Tick Retrieval**:

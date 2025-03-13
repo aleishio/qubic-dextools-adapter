@@ -23,8 +23,8 @@ class QubicRpcClient {
     // Safety buffer for latest block (how many blocks to go back from absolute latest)
     this.LATEST_BLOCK_SAFETY_BUFFER = 10;
     
-    // Use 500 as default page size for performance
-    this.DEFAULT_PAGE_SIZE = 500;
+    // Use 10000 as default page size for performance
+    this.DEFAULT_PAGE_SIZE = 10000;
   }
 
   // ========== Helper Methods ==========
@@ -78,7 +78,7 @@ class QubicRpcClient {
     console.log(`Getting all ticks from epoch ${epoch} (up to ${maxTicks === Infinity ? 'unlimited' : maxTicks})`);
     
     const allTicks = [];
-    const pageSize = 500; // INCREASED from 100 to 500 for better performance
+    const pageSize = 10000; // INCREASED from 500 to 10000 for better performance
     let page = 0;
     let hasMoreData = true;
     let emptyPageCount = 0;
@@ -271,7 +271,7 @@ class QubicRpcClient {
         const MAX_PAGES = 2; // Only check up to 2 pages
         
         let recentTicks = [];
-        const pageSize = 100;
+        const pageSize = 10000; // INCREASED from 500 to 10000 for better performance
         
         // Try to get specifically the page that might contain our tick
         const estimatedPage = Math.floor(safeTickNumber / pageSize);
@@ -406,7 +406,7 @@ class QubicRpcClient {
       }
       
       // First try to get the tick directly by estimating the page
-      const pageSize = this.DEFAULT_PAGE_SIZE;
+      const pageSize = 10000; // INCREASED from 500 to 10000 for better performance
       const estimatedPage = Math.floor(tickNumber / pageSize);
       const currentEpoch = await this.getCurrentEpoch();
       
@@ -575,7 +575,7 @@ class QubicRpcClient {
   // Helper method to find nearest tick using binary search approach
   async findNearestTickWithBinarySearch(epoch, targetTickNumber, maxAttempts = 8) {
     console.log(`Using binary search to find nearest tick to ${targetTickNumber} in epoch ${epoch}`);
-    const pageSize = this.DEFAULT_PAGE_SIZE;
+    const pageSize = 10000; // INCREASED from 500 to 10000 for better performance
     
     // Start with page 0 to establish minimum
     let lowPage = 0;
@@ -678,7 +678,7 @@ class QubicRpcClient {
       
       // Collect all valid ticks in this range
       const validTicks = [];
-      const pageSize = 500; // INCREASED from 100 to 500 for better performance
+      const pageSize = 10000; // INCREASED from 500 to 10000 for better performance
       const currentEpoch = await this.getCurrentEpoch();
       
       // Use a targeted approach instead of scanning all ticks
@@ -810,7 +810,7 @@ class QubicRpcClient {
       const currentEpoch = await this.getCurrentEpoch();
       
       const validTicks = [];
-      const pageSize = 500; // INCREASED from 100 to 500 for better performance
+      const pageSize = 10000; // INCREASED from 500 to 10000 for better performance
       
       // Just get the first page of ticks for the most recent ones
       console.log(`Getting recent ticks from epoch ${currentEpoch}`);
