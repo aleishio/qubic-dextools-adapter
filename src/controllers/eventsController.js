@@ -2,22 +2,21 @@ const qubicRpcClient = require('../services/qubicRpcClient');
 const dataTransformer = require('../services/dataTransformer');
 
 /**
- * Events controller for the /events endpoint
- * 
- * This is a critical endpoint for DEXTools indexing. According to the spec:
- * 1. DEXTools calls /latest-block to get the latest processed block
- * 2. It then calls /events with fromBlock and toBlock to get events for blocks it hasn't indexed
- * 3. We MUST return ALL events for the requested block range or DEXTools will miss them permanently
+ * Events controller handles fetching events within a specific block range
+ * This is critical for DEXTools to properly index the chain
  */
 class EventsController {
   /**
-   * Get events in a block range
+   * Get events in a specified block range
+   * DEXTools specification requires this endpoint to:
+   * - Return all events in the specified block range
+   * - Support pagination for large ranges
    */
   async getEvents(req, res) {
+    const { fromBlock, toBlock } = req.query;
+    
     try {
-      const { fromBlock, toBlock } = req.query;
-      
-      // Validate params
+      // Validate the presence of fromBlock and toBlock
       if (!fromBlock || !toBlock) {
         return res.status(400).json({
           code: '400',
@@ -32,10 +31,11 @@ class EventsController {
         });
       }
       
-      const fromBlockNum = parseInt(fromBlock, 10);
-      const toBlockNum = parseInt(toBlock, 10);
+      // Convert params to integers and validate
+      const fromBlockInt = parseInt(fromBlock, 10);
+      const toBlockInt = parseInt(toBlock, 10);
       
-      if (isNaN(fromBlockNum) || isNaN(toBlockNum)) {
+      if (isNaN(fromBlockInt) || isNaN(toBlockInt) || fromBlockInt < 0 || toBlockInt < 0) {
         return res.status(400).json({
           code: '400',
           message: 'Invalid parameters',
@@ -43,27 +43,14 @@ class EventsController {
             {
               param: 'fromBlock/toBlock',
               code: 'invalid',
-              message: 'Both parameters must be integers'
+              message: 'Block numbers must be positive integer values'
             }
           ]
         });
       }
       
-      if (fromBlockNum < 0 || toBlockNum < 0) {
-        return res.status(400).json({
-          code: '400',
-          message: 'Invalid parameters',
-          issues: [
-            {
-              param: 'fromBlock/toBlock',
-              code: 'negative',
-              message: 'Block numbers cannot be negative'
-            }
-          ]
-        });
-      }
-      
-      if (fromBlockNum > toBlockNum) {
+      // Validate that fromBlock <= toBlock
+      if (fromBlockInt > toBlockInt) {
         return res.status(400).json({
           code: '400',
           message: 'Invalid parameters',
@@ -77,91 +64,74 @@ class EventsController {
         });
       }
       
-      const blockRange = toBlockNum - fromBlockNum + 1;
-      console.log(`Requested block range: ${fromBlockNum}-${toBlockNum} (${blockRange} blocks)`);
+      // Set a maximum range to prevent issues with huge ranges
+      const MAX_BLOCK_RANGE = 10000;
+      const requestedRange = toBlockInt - fromBlockInt + 1;
       
-      // Check if the range is too large - increased limit for DEXTools compatibility
-      // DEXTools typically requests ranges of a few hundred blocks at a time
-      // But we should support larger ranges for initial syncing
-      const MAX_BLOCK_RANGE = 100000; // Increased from 10000 to support initial sync
-      
-      if (blockRange > MAX_BLOCK_RANGE) {
-        console.warn(`Requested range ${blockRange} exceeds max allowed range ${MAX_BLOCK_RANGE}`);
+      if (requestedRange > MAX_BLOCK_RANGE) {
+        console.warn(`Requested block range ${requestedRange} exceeds maximum allowed (${MAX_BLOCK_RANGE}). Consider using pagination.`);
         return res.status(400).json({
           code: '400',
           message: 'Invalid parameters',
           issues: [
             {
               param: 'fromBlock/toBlock',
-              code: 'range_too_large',
-              message: `Range too large. Maximum block range allowed is ${MAX_BLOCK_RANGE}`
+              code: 'invalid',
+              message: `Block range is too large. Maximum allowed range is ${MAX_BLOCK_RANGE} blocks. Use pagination for larger ranges.`
             }
           ]
         });
       }
       
-      // Get ticks in the requested range
-      // This will handle large ranges efficiently with pagination across epochs
-      console.log(`Getting ticks in range ${fromBlockNum}-${toBlockNum}...`);
+      console.log(`Requested block range: ${fromBlockInt}-${toBlockInt} (${requestedRange} blocks)`);
+      console.log(`Getting ticks in range ${fromBlockInt}-${toBlockInt}...`);
       
-      // Don't limit the number of ticks - DEXTools needs ALL ticks in the range
-      const ticksInRange = await qubicRpcClient.getTicksInBlockRange(fromBlockNum, toBlockNum);
+      // Get ticks in the block range using our optimized method
+      const ticks = await qubicRpcClient.getTicksInBlockRange(fromBlockInt, toBlockInt, 1000);
+      console.log(`Found ${ticks.length} ticks in the requested range`);
       
-      if (!ticksInRange || ticksInRange.length === 0) {
-        console.log(`No valid ticks found in range ${fromBlockNum}-${toBlockNum}`);
-        // Return empty events array if no ticks found
+      // If no ticks were found, return an empty events array - don't fall back to inefficient methods
+      if (ticks.length === 0) {
         return res.json({ events: [] });
       }
       
-      console.log(`Found ${ticksInRange.length} valid ticks in range ${fromBlockNum}-${toBlockNum}`);
-      
-      // Process each tick to extract events
+      // Extract events from all ticks
       const allEvents = [];
-      let processedCount = 0;
       
-      for (const tick of ticksInRange) {
+      console.log(`Processing ${ticks.length} ticks to extract events...`);
+      for (const tick of ticks) {
         try {
-          processedCount++;
-          // Log progress for large ranges
-          if (processedCount % 100 === 0) {
-            console.log(`Processing tick ${tick.tickNumber} (${processedCount}/${ticksInRange.length})`);
-          }
-          
           // Get transactions for this tick
           const transactions = await qubicRpcClient.getTransactionsForTick(tick.tickNumber);
+          console.log(`Found ${transactions.length} transactions in tick ${tick.tickNumber}`);
           
+          // Extract events from transactions
           if (transactions && transactions.length > 0) {
-            console.log(`Found ${transactions.length} transactions in tick ${tick.tickNumber}`);
-            
-            // Transform transactions to events
             const eventsFromTick = await dataTransformer.transformTransactionsToEvents(
-              transactions, 
+              transactions,
               tick
             );
             
             if (eventsFromTick && eventsFromTick.length > 0) {
-              console.log(`Extracted ${eventsFromTick.length} events from tick ${tick.tickNumber}`);
+              console.log(`Found ${eventsFromTick.length} events in tick ${tick.tickNumber}`);
               allEvents.push(...eventsFromTick);
             }
-          } else {
-            console.log(`No transactions found in tick ${tick.tickNumber}`);
           }
-        } catch (tickError) {
-          console.error(`Error processing tick ${tick.tickNumber}:`, tickError.message);
-          // Continue to next tick even if there's an error - don't skip any ticks
+        } catch (error) {
+          console.error(`Error processing tick ${tick.tickNumber}:`, error.message);
+          // Continue to next tick even if we encounter an error
         }
       }
       
-      console.log(`Total events found in range ${fromBlockNum}-${toBlockNum}: ${allEvents.length}`);
-      
-      // Sort events by block number and event index - crucial for DEXTools
+      // Sort events by block number and then by event index
       allEvents.sort((a, b) => {
         if (a.block.blockNumber !== b.block.blockNumber) {
           return a.block.blockNumber - b.block.blockNumber;
         }
-        return a.eventIndex - b.eventIndex;
+        return (a.eventIndex || 0) - (b.eventIndex || 0);
       });
       
+      console.log(`Returning ${allEvents.length} events for block range ${fromBlockInt}-${toBlockInt}`);
       return res.json({ events: allEvents });
     } catch (error) {
       console.error('Error getting events:', error);

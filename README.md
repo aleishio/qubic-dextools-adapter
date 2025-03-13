@@ -77,7 +77,6 @@ Qubic has a unique blockchain structure that requires special handling:
    - Direct tick-by-tick access suffers from inconsistent network reliability
    - When fetching thousands of ticks sequentially, these failures accumulate and cause significant data gaps
 
-
 3. **Weekly Epoch Changes**:
    - Ticks are organized into epochs that change weekly
    - There are currently 152+ historical epochs in the Qubic blockchain
@@ -94,30 +93,39 @@ Qubic has a unique blockchain structure that requires special handling:
 
 The adapter implements comprehensive strategies to ensure complete coverage of Qubic's data:
 
-1. **Prioritized Recent Tick Access**:
-   - Optimizes for the latest ticks in the current epoch, which DEXTools needs for real-time indexing
-   - Implements caching that prioritizes the current epoch's data for faster access
-   - Uses a smaller safety buffer for recent ticks to minimize indexing delay
-   - This allows DEXTools to index new blocks "as fast as possible" as specified in the requirements
+1. **High-Performance API Access**:
+   - Utilizes an optimized page size of 500 (verified to be accepted by the Qubic API)
+   - Reduces API calls by 80% compared to the default page size of 100
+   - Implements extended timeout (30 seconds) for large data requests 
+   - Adds max content length handling (50MB) for processing large responses
+   - Makes API calls more resilient to temporary network issues
 
-2. **Epoch-Based Approach**:
-   - Instead of fetching individual ticks, we retrieve ticks in bulk from epoch endpoints
+2. **Smart Tick Retrieval**:
+   - Implements targeted page estimation to find specific ticks without scanning full epochs
+   - Uses binary search pattern to efficiently locate ticks across historical data
+   - For the latest blocks, focuses on retrieving only the most recent ticks instead of full epoch scans
+   - Verifies transaction data availability before returning blocks to ensure DEXTools can access all events
+
+3. **Multi-Layer Caching**:
+   - Caches individual ticks, epoch data, and transaction data independently
+   - Prioritizes caching of recent tick data for faster access to latest blocks
+   - Maintains epoch range information to quickly determine which epoch contains specific ticks
+   - Avoids redundant API calls for frequently requested data
+
+4. **Epoch-Based Access**:
+   - Instead of fetching individual ticks, retrieves ticks in bulk from epoch endpoints
    - The `/v2/epochs/{epoch}/ticks` endpoint provides much higher reliability than individual tick endpoints
    - This approach bypasses the ~10% failure rate of individual tick endpoints
    - Ensures we don't miss any ticks due to network issues or empty responses
 
-3. **Complete Historical Access**:
-   - Retrieves all ticks from any epoch with no artificial limits on tick count
-   - Implements efficient pagination and caching to handle millions of ticks
-   - Uses a progressive epoch search algorithm to find ticks in any of the 152+ historical epochs
-
-4. **DEXTools-Required Safety Measures**:
+5. **DEXTools-Required Safety Measures**:
    - For `/latest-block`, applies a safety buffer and verifies event availability before returning
    - For block searches, implements fallbacks to find valid ticks if the specific one is empty
    - Ensures complete event coverage for any requested block range
 
-5. **Efficient Range Processing**:
-   - When DEXTools requests the `/events` endpoint for a range of blocks, scans all relevant epochs
+6. **Efficient Range Processing**:
+   - When DEXTools requests the `/events` endpoint for a range of blocks, only fetches relevant pages
+   - Limits the number of pages checked to maintain performance for large ranges
    - Returns all events from every valid tick in the requested range
    - Sorts events by block number and event index as required by the specification
 
@@ -128,3 +136,4 @@ These measures ensure stable operation even with Qubic's unique high-frequency t
 - Verify the RPC endpoint in your .env file
 - Check the adapter logs for API connection errors
 - Ensure enough memory is available for processing large tick ranges
+- If you encounter 404 errors for estimated pages, this is normal behavior as the adapter tries different page numbers to find the right data

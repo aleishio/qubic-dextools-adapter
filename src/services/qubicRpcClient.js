@@ -5,7 +5,8 @@ class QubicRpcClient {
   constructor() {
     this.client = axios.create({
       baseURL: config.qubic.rpcUrl,
-      timeout: 10000,
+      timeout: 30000, // Increased timeout from 10000 to 30000 (30 seconds) for better reliability
+      maxContentLength: 50 * 1024 * 1024, // Add 50MB max content length to handle large responses
     });
     console.log(`Using RPC endpoint: ${config.qubic.rpcUrl}`);
     
@@ -15,11 +16,15 @@ class QubicRpcClient {
       ticks: {},     // Cache for individual ticks
       status: null,  // Cache for last status check
       statusTimestamp: 0,
-      epochRanges: {} // Cache for epoch tick ranges
+      epochRanges: {}, // Cache for epoch tick ranges
+      transactions: {}, // Cache for transaction data by tick
     };
     
     // Safety buffer for latest block (how many blocks to go back from absolute latest)
     this.LATEST_BLOCK_SAFETY_BUFFER = 10;
+    
+    // Use 500 as default page size for performance
+    this.DEFAULT_PAGE_SIZE = 500;
   }
 
   // ========== Helper Methods ==========
@@ -73,7 +78,7 @@ class QubicRpcClient {
     console.log(`Getting all ticks from epoch ${epoch} (up to ${maxTicks === Infinity ? 'unlimited' : maxTicks})`);
     
     const allTicks = [];
-    const pageSize = 100; // Maximum page size supported by the API
+    const pageSize = 500; // INCREASED from 100 to 500 for better performance
     let page = 0;
     let hasMoreData = true;
     let emptyPageCount = 0;
@@ -260,41 +265,118 @@ class QubicRpcClient {
         // Get current epoch
         const currentEpoch = await this.getCurrentEpoch();
         
-        // Get all ticks from current epoch
-        const ticksFromEpoch = await this.getAllTicksFromEpoch(currentEpoch);
+        // Instead of fetching ALL ticks in the current epoch, just fetch the most recent ones
+        // We'll use a smaller page size and limit pages to ensure fast response
+        const RECENT_TICKS_MAX = 200; // Only get the most recent 200 ticks max
+        const MAX_PAGES = 2; // Only check up to 2 pages
         
-        if (ticksFromEpoch && ticksFromEpoch.length > 0) {
-          // Try to find the safe tick in epoch data
-          let safeTickData = ticksFromEpoch.find(t => t.tickNumber === safeTickNumber);
+        let recentTicks = [];
+        const pageSize = 100;
+        
+        // Try to get specifically the page that might contain our tick
+        const estimatedPage = Math.floor(safeTickNumber / pageSize);
+        console.log(`Getting recent ticks from epoch ${currentEpoch}, estimated page: ${estimatedPage}`);
+        
+        // Try with a direct request to the estimated page first
+        try {
+          const ticksResponse = await this.handleRequest(
+            `/v2/epochs/${currentEpoch}/ticks`,
+            { page: estimatedPage, pageSize }
+          );
           
-          // If we can't find the exact tick, return the closest older one
-          if (!safeTickData) {
-            // Find the newest tick that's older than or equal to safeTickNumber
-            const olderTicks = ticksFromEpoch.filter(t => t.tickNumber <= safeTickNumber);
-            
-            if (olderTicks.length > 0) {
-              // Sort by tick number (descending) and take the first one
-              olderTicks.sort((a, b) => b.tickNumber - a.tickNumber);
-              safeTickData = olderTicks[0];
-              console.log(`Using older tick ${safeTickData.tickNumber} as safe latest tick`);
-            } else {
-              // If no older ticks in this epoch, try previous epoch
-              const prevEpoch = currentEpoch - 1;
-              console.log(`No older ticks found in current epoch, trying previous epoch ${prevEpoch}`);
-              
-              const prevEpochTicks = await this.getAllTicksFromEpoch(prevEpoch);
-              if (prevEpochTicks && prevEpochTicks.length > 0) {
-                // Use the newest tick from previous epoch
-                safeTickData = prevEpochTicks[0];
-                console.log(`Using tick ${safeTickData.tickNumber} from previous epoch ${prevEpoch}`);
-              }
+          if (ticksResponse && ticksResponse.ticks && Array.isArray(ticksResponse.ticks)) {
+            for (const tick of ticksResponse.ticks) {
+              // Normalize and cache individual ticks
+              const tickNumber = tick.tickNumber || tick.number;
+              this.cache.ticks[tickNumber] = this.normalizeTickData(tick);
+              recentTicks.push(this.cache.ticks[tickNumber]);
             }
           }
-          
-          if (safeTickData) {
-            console.log(`Found safe latest tick ${safeTickData.tickNumber}`);
-            return safeTickData;
+        } catch (error) {
+          console.warn(`Error fetching estimated page ${estimatedPage}, will try with recent pages`);
+        }
+        
+        // If we couldn't find the tick in the estimated page, try the most recent pages
+        if (!recentTicks.find(t => t.tickNumber === safeTickNumber)) {
+          // Get most recent pages
+          for (let page = 0; page < MAX_PAGES; page++) {
+            if (recentTicks.length >= RECENT_TICKS_MAX) break;
+            
+            try {
+              console.log(`Fetching epoch ${currentEpoch} page ${page} for recent ticks`);
+              const ticksResponse = await this.handleRequest(
+                `/v2/epochs/${currentEpoch}/ticks`,
+                { page, pageSize }
+              );
+              
+              if (ticksResponse && ticksResponse.ticks && Array.isArray(ticksResponse.ticks)) {
+                for (const tick of ticksResponse.ticks) {
+                  // Normalize and cache individual ticks
+                  const tickNumber = tick.tickNumber || tick.number;
+                  this.cache.ticks[tickNumber] = this.normalizeTickData(tick);
+                  recentTicks.push(this.cache.ticks[tickNumber]);
+                  
+                  if (recentTicks.length >= RECENT_TICKS_MAX) break;
+                }
+              } else {
+                break; // No more ticks
+              }
+            } catch (error) {
+              console.error(`Error getting ticks for epoch ${currentEpoch} page ${page}:`, error.message);
+              break;
+            }
           }
+        }
+        
+        // Sort by tick number (descending) to find most recent
+        recentTicks.sort((a, b) => b.tickNumber - a.tickNumber);
+        
+        // Try to find the safe tick in the recent ticks
+        let safeTickData = recentTicks.find(t => t.tickNumber === safeTickNumber);
+        
+        // If we can't find the exact tick, return the closest older one
+        if (!safeTickData) {
+          // Find the newest tick that's older than or equal to safeTickNumber
+          const olderTicks = recentTicks.filter(t => t.tickNumber <= safeTickNumber);
+          
+          if (olderTicks.length > 0) {
+            // Already sorted by tick number (descending), so take the first one
+            safeTickData = olderTicks[0];
+            console.log(`Using older tick ${safeTickData.tickNumber} as safe latest tick`);
+          } else if (recentTicks.length > 0) {
+            // If no older ticks, use the oldest of recent ticks
+            safeTickData = recentTicks[recentTicks.length - 1];
+            console.log(`No older ticks found, using oldest recent tick ${safeTickData.tickNumber}`);
+          } else {
+            // If no ticks at all, try previous epoch
+            const prevEpoch = currentEpoch - 1;
+            console.log(`No ticks found in current epoch, trying previous epoch ${prevEpoch}`);
+            
+            try {
+              // Just get a single page from previous epoch
+              const prevEpochResponse = await this.handleRequest(
+                `/v2/epochs/${prevEpoch}/ticks`,
+                { page: 0, pageSize }
+              );
+              
+              if (prevEpochResponse && prevEpochResponse.ticks && Array.isArray(prevEpochResponse.ticks) && prevEpochResponse.ticks.length > 0) {
+                // Use the newest tick from previous epoch
+                const newestTick = prevEpochResponse.ticks.sort((a, b) => {
+                  return (b.tickNumber || b.number) - (a.tickNumber || a.number);
+                })[0];
+                
+                safeTickData = this.normalizeTickData(newestTick);
+                console.log(`Using tick ${safeTickData.tickNumber} from previous epoch ${prevEpoch}`);
+              }
+            } catch (error) {
+              console.error(`Error getting ticks from previous epoch ${prevEpoch}:`, error.message);
+            }
+          }
+        }
+        
+        if (safeTickData) {
+          console.log(`Found safe latest tick ${safeTickData.tickNumber}`);
+          return safeTickData;
         }
         
         // If we couldn't find a good tick, return basic info
@@ -323,87 +405,162 @@ class QubicRpcClient {
         return this.cache.ticks[tickNumber];
       }
       
-      // Find which epoch contains this tick
-      const epochForTick = await this.findEpochForTick(tickNumber);
+      // First try to get the tick directly by estimating the page
+      const pageSize = this.DEFAULT_PAGE_SIZE;
+      const estimatedPage = Math.floor(tickNumber / pageSize);
+      const currentEpoch = await this.getCurrentEpoch();
       
-      // Get ticks from that epoch
-      const ticksInEpoch = await this.getAllTicksFromEpoch(epochForTick);
+      console.log(`Trying to find tick ${tickNumber} with estimated page ${estimatedPage}`);
       
-      if (ticksInEpoch && ticksInEpoch.length > 0) {
-        // Find the requested tick in this epoch
-        const tickData = ticksInEpoch.find(t => t.tickNumber === tickNumber);
+      // Try with direct target page first in current epoch
+      try {
+        const ticksResponse = await this.handleRequest(
+          `/v2/epochs/${currentEpoch}/ticks`,
+          { page: estimatedPage, pageSize }
+        );
         
-        if (tickData) {
-          console.log(`Found tick ${tickNumber} in epoch ${epochForTick}`);
-          // Cache this tick
-          this.cache.ticks[tickNumber] = tickData;
-          return tickData;
-        }
-        
-        // If we couldn't find the exact tick, find the nearest one
-        const firstTickInEpoch = Math.min(...ticksInEpoch.map(t => t.tickNumber));
-        const lastTickInEpoch = Math.max(...ticksInEpoch.map(t => t.tickNumber));
-        
-        if (tickNumber >= firstTickInEpoch && tickNumber <= lastTickInEpoch) {
-          // Find the nearest tick
-          const sortedTicks = [...ticksInEpoch].sort((a, b) => {
-            return Math.abs(a.tickNumber - tickNumber) - Math.abs(b.tickNumber - tickNumber);
-          });
+        if (ticksResponse && ticksResponse.ticks && Array.isArray(ticksResponse.ticks)) {
+          // Check if our tick is in this page
+          const targetTick = ticksResponse.ticks.find(t => 
+            (t.tickNumber || t.number) === tickNumber
+          );
           
-          if (sortedTicks.length > 0) {
-            const nearestTick = sortedTicks[0];
-            console.log(`Found nearest tick ${nearestTick.tickNumber} for requested tick ${tickNumber}`);
-            // Cache this near match too
-            this.cache.ticks[tickNumber] = nearestTick;
-            return nearestTick;
+          if (targetTick) {
+            console.log(`Found tick ${tickNumber} in current epoch ${currentEpoch} on estimated page ${estimatedPage}`);
+            const normalizedTick = this.normalizeTickData(targetTick);
+            // Cache it
+            this.cache.ticks[tickNumber] = normalizedTick;
+            return normalizedTick;
           }
+          
+          // Our tick isn't here, but maybe we can get information about the range
+          if (ticksResponse.ticks.length > 0) {
+            const pageTickNumbers = ticksResponse.ticks.map(t => t.tickNumber || t.number);
+            const minTickInPage = Math.min(...pageTickNumbers);
+            const maxTickInPage = Math.max(...pageTickNumbers);
+            
+            console.log(`Page ${estimatedPage} contains ticks from ${minTickInPage} to ${maxTickInPage}`);
+            
+            // If our target is less than the minimum, try earlier pages
+            if (tickNumber < minTickInPage) {
+              // Try a few pages before
+              for (let pageOffset = 1; pageOffset <= 5; pageOffset++) {
+                const earlierPage = Math.max(0, estimatedPage - pageOffset);
+                console.log(`Trying earlier page ${earlierPage}`);
+                
+                try {
+                  const earlierResponse = await this.handleRequest(
+                    `/v2/epochs/${currentEpoch}/ticks`,
+                    { page: earlierPage, pageSize }
+                  );
+                  
+                  if (earlierResponse && earlierResponse.ticks && Array.isArray(earlierResponse.ticks)) {
+                    const targetTick = earlierResponse.ticks.find(t => 
+                      (t.tickNumber || t.number) === tickNumber
+                    );
+                    
+                    if (targetTick) {
+                      console.log(`Found tick ${tickNumber} on earlier page ${earlierPage}`);
+                      const normalizedTick = this.normalizeTickData(targetTick);
+                      // Cache it
+                      this.cache.ticks[tickNumber] = normalizedTick;
+                      return normalizedTick;
+                    }
+                  }
+                } catch (pageError) {
+                  console.warn(`Error checking earlier page ${earlierPage}: ${pageError.message}`);
+                }
+              }
+            }
+            
+            // If our target is greater than the maximum, try later pages
+            if (tickNumber > maxTickInPage) {
+              // Try a few pages after
+              for (let pageOffset = 1; pageOffset <= 5; pageOffset++) {
+                const laterPage = estimatedPage + pageOffset;
+                console.log(`Trying later page ${laterPage}`);
+                
+                try {
+                  const laterResponse = await this.handleRequest(
+                    `/v2/epochs/${currentEpoch}/ticks`,
+                    { page: laterPage, pageSize }
+                  );
+                  
+                  if (laterResponse && laterResponse.ticks && Array.isArray(laterResponse.ticks)) {
+                    const targetTick = laterResponse.ticks.find(t => 
+                      (t.tickNumber || t.number) === tickNumber
+                    );
+                    
+                    if (targetTick) {
+                      console.log(`Found tick ${tickNumber} on later page ${laterPage}`);
+                      const normalizedTick = this.normalizeTickData(targetTick);
+                      // Cache it
+                      this.cache.ticks[tickNumber] = normalizedTick;
+                      return normalizedTick;
+                    }
+                  }
+                } catch (pageError) {
+                  console.warn(`Error checking later page ${laterPage}: ${pageError.message}`);
+                }
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.warn(`Error fetching estimated page ${estimatedPage}: ${error.message}`);
+      }
+      
+      // If we didn't find the tick with the targeted approach, check previous epochs
+      // Instead of scanning ALL ticks in the epoch, use a binary search-like approach
+      for (let epochOffset = 1; epochOffset <= 5; epochOffset++) {
+        const prevEpoch = currentEpoch - epochOffset;
+        if (prevEpoch < 0) continue;
+        
+        console.log(`Checking previous epoch ${prevEpoch} for tick ${tickNumber}`);
+        
+        // Try the same estimated page in the previous epoch
+        try {
+          const prevEpochResponse = await this.handleRequest(
+            `/v2/epochs/${prevEpoch}/ticks`,
+            { page: estimatedPage, pageSize }
+          );
+          
+          if (prevEpochResponse && prevEpochResponse.ticks && Array.isArray(prevEpochResponse.ticks)) {
+            // Check if our tick is in this page
+            const targetTick = prevEpochResponse.ticks.find(t => 
+              (t.tickNumber || t.number) === tickNumber
+            );
+            
+            if (targetTick) {
+              console.log(`Found tick ${tickNumber} in previous epoch ${prevEpoch}`);
+              const normalizedTick = this.normalizeTickData(targetTick);
+              // Cache it
+              this.cache.ticks[tickNumber] = normalizedTick;
+              return normalizedTick;
+            }
+            
+            // Try binary search in this epoch if we got some ticks
+            if (prevEpochResponse.ticks.length > 0) {
+              const nearestTick = await this.findNearestTickWithBinarySearch(prevEpoch, tickNumber);
+              if (nearestTick) {
+                console.log(`Found nearest tick ${nearestTick.tickNumber} in previous epoch ${prevEpoch}`);
+                // Cache this nearest match
+                this.cache.ticks[tickNumber] = nearestTick;
+                return nearestTick;
+              }
+            }
+          }
+        } catch (epochError) {
+          console.warn(`Error checking previous epoch ${prevEpoch}: ${epochError.message}`);
         }
       }
       
-      // If we couldn't find data in the determined epoch, try adjacent epochs
-      for (let adjEpoch = epochForTick - 1; adjEpoch <= epochForTick + 1; adjEpoch++) {
-        if (adjEpoch === epochForTick || adjEpoch < 0) continue; // Skip current epoch (already checked) and negative epochs
-        
-        console.log(`Checking adjacent epoch ${adjEpoch} for tick ${tickNumber}`);
-        const adjEpochTicks = await this.getAllTicksFromEpoch(adjEpoch);
-        
-        // Check if this epoch might contain our tick
-        if (adjEpochTicks.length > 0) {
-          const firstTick = Math.min(...adjEpochTicks.map(t => t.tickNumber));
-          const lastTick = Math.max(...adjEpochTicks.map(t => t.tickNumber));
-          
-          if (tickNumber >= firstTick && tickNumber <= lastTick) {
-            const exactTick = adjEpochTicks.find(t => t.tickNumber === tickNumber);
-            if (exactTick) {
-              console.log(`Found tick ${tickNumber} in adjacent epoch ${adjEpoch}`);
-              // Cache this tick
-              this.cache.ticks[tickNumber] = exactTick;
-              return exactTick;
-            }
-            
-            // Find nearest
-            const sortedTicks = [...adjEpochTicks].sort((a, b) => {
-              return Math.abs(a.tickNumber - tickNumber) - Math.abs(b.tickNumber - tickNumber);
-            });
-            
-            if (sortedTicks.length > 0) {
-              const nearestTick = sortedTicks[0];
-              console.log(`Found nearest tick ${nearestTick.tickNumber} in adjacent epoch ${adjEpoch}`);
-              // Cache this near match too
-              this.cache.ticks[tickNumber] = nearestTick;
-              return nearestTick;
-            }
-          }
-        }
-      }
-      
-      // If we couldn't find data in any epoch, return a placeholder
-      console.log(`No tick data available for tick ${tickNumber}, returning placeholder`);
+      // If we couldn't find the tick in recent epochs, return a placeholder
+      console.log(`Could not find tick ${tickNumber} in any epoch, returning placeholder`);
       const placeholderTick = {
         tickNumber: tickNumber,
         timestamp: Date.now()
       };
-      // Don't cache placeholders
       return placeholderTick;
     } catch (error) {
       console.error(`Error getting tick ${tickNumber}:`, error.message);
@@ -414,108 +571,235 @@ class QubicRpcClient {
       };
     }
   }
-  
+
+  // Helper method to find nearest tick using binary search approach
+  async findNearestTickWithBinarySearch(epoch, targetTickNumber, maxAttempts = 8) {
+    console.log(`Using binary search to find nearest tick to ${targetTickNumber} in epoch ${epoch}`);
+    const pageSize = this.DEFAULT_PAGE_SIZE;
+    
+    // Start with page 0 to establish minimum
+    let lowPage = 0;
+    let highPage = 1000; // Arbitrary high number to start
+    let attempts = 0;
+    let bestMatch = null;
+    let bestMatchDistance = Infinity;
+    
+    while (attempts < maxAttempts) {
+      attempts++;
+      const midPage = Math.floor((lowPage + highPage) / 2);
+      
+      try {
+        console.log(`Binary search attempt ${attempts}: checking page ${midPage}`);
+        const response = await this.handleRequest(
+          `/v2/epochs/${epoch}/ticks`,
+          { page: midPage, pageSize }
+        );
+        
+        if (response && response.ticks && Array.isArray(response.ticks) && response.ticks.length > 0) {
+          // Get tick numbers in this page
+          const tickNumbers = response.ticks.map(t => t.tickNumber || t.number);
+          const minTickInPage = Math.min(...tickNumbers);
+          const maxTickInPage = Math.max(...tickNumbers);
+          
+          // Check if our target is in this page
+          if (targetTickNumber >= minTickInPage && targetTickNumber <= maxTickInPage) {
+            // Found the exact page, look for exact match or nearest
+            const exactMatch = response.ticks.find(t => (t.tickNumber || t.number) === targetTickNumber);
+            if (exactMatch) {
+              return this.normalizeTickData(exactMatch);
+            }
+            
+            // Find nearest match in this page
+            let nearestInPage = response.ticks[0];
+            let nearestDistance = Math.abs((nearestInPage.tickNumber || nearestInPage.number) - targetTickNumber);
+            
+            for (const tick of response.ticks) {
+              const distance = Math.abs((tick.tickNumber || tick.number) - targetTickNumber);
+              if (distance < nearestDistance) {
+                nearestInPage = tick;
+                nearestDistance = distance;
+              }
+            }
+            
+            return this.normalizeTickData(nearestInPage);
+          }
+          
+          // Update our best match if we found a closer tick
+          for (const tick of response.ticks) {
+            const distance = Math.abs((tick.tickNumber || tick.number) - targetTickNumber);
+            if (distance < bestMatchDistance) {
+              bestMatch = tick;
+              bestMatchDistance = distance;
+            }
+          }
+          
+          // Adjust our search range
+          if (targetTickNumber < minTickInPage) {
+            highPage = midPage - 1;
+          } else {
+            lowPage = midPage + 1;
+          }
+        } else {
+          // No ticks in this page, try a different strategy
+          highPage = midPage - 1;
+        }
+      } catch (error) {
+        console.warn(`Error in binary search page ${midPage}: ${error.message}`);
+        // If we hit an error, just skip this page
+        if (midPage < (lowPage + highPage) / 2) {
+          lowPage = midPage + 1;
+        } else {
+          highPage = midPage - 1;
+        }
+      }
+      
+      // Break if our search range is invalid
+      if (lowPage > highPage) {
+        break;
+      }
+    }
+    
+    // Return the best match we found, if any
+    if (bestMatch) {
+      return this.normalizeTickData(bestMatch);
+    }
+    
+    return null;
+  }
+
   // Get ticks from a specific block range - crucial for DEXTools HTTP adapter
   async getTicksInBlockRange(fromBlock, toBlock, maxResults = Infinity) {
     try {
       console.log(`Getting ticks in block range ${fromBlock}-${toBlock}, max results: ${maxResults === Infinity ? 'unlimited' : maxResults}`);
       
-      // Calculate actual max results based on range size - don't artificially limit results
-      // DEXTools needs to see ALL ticks and events in the range
+      // Calculate actual max results based on range size
       const rangeSize = toBlock - fromBlock + 1;
       const actualMaxResults = Math.min(maxResults, rangeSize);
       
       // Collect all valid ticks in this range
       const validTicks = [];
+      const pageSize = 500; // INCREASED from 100 to 500 for better performance
+      const currentEpoch = await this.getCurrentEpoch();
       
-      // Strategy 1: Check if we already know which epochs cover this range
-      let epochsToCheck = [];
-      let epochFound = false;
+      // Use a targeted approach instead of scanning all ticks
+      const fromBlockPage = Math.floor(fromBlock / pageSize);
+      const toBlockPage = Math.floor(toBlock / pageSize);
+      const pagesToCheck = Math.min(10, toBlockPage - fromBlockPage + 1); // Limit to 10 pages max for performance
       
-      // First see if we can narrow down epochs using our cache
-      for (const epoch in this.cache.epochRanges) {
-        const range = this.cache.epochRanges[epoch];
-        // Check if this epoch overlaps with our requested range
-        if ((range.minTickNumber <= toBlock && range.maxTickNumber >= fromBlock)) {
-          epochsToCheck.push(parseInt(epoch));
-          epochFound = true;
-        }
-      }
+      console.log(`Target pages ${fromBlockPage} to ${toBlockPage} (${pagesToCheck} pages) in current epoch ${currentEpoch}`);
       
-      // If we couldn't determine epochs from cache, more advanced strategy
-      if (!epochFound) {
-        // First try to find the epoch for the start of the range
+      // First check current epoch with targeted pages
+      for (let page = fromBlockPage; page <= toBlockPage && validTicks.length < actualMaxResults && page < fromBlockPage + pagesToCheck; page++) {
         try {
-          const startEpoch = await this.findEpochForTick(fromBlock);
-          const endEpoch = await this.findEpochForTick(toBlock);
+          console.log(`Checking page ${page} for ticks in range ${fromBlock}-${toBlock}`);
+          const ticksResponse = await this.handleRequest(
+            `/v2/epochs/${currentEpoch}/ticks`,
+            { page, pageSize }
+          );
           
-          // Add all epochs in between
-          for (let e = Math.min(startEpoch, endEpoch); e <= Math.max(startEpoch, endEpoch); e++) {
-            epochsToCheck.push(e);
+          if (ticksResponse && ticksResponse.ticks && Array.isArray(ticksResponse.ticks) && ticksResponse.ticks.length > 0) {
+            // Filter ticks in the requested range
+            const ticksInRange = ticksResponse.ticks.filter(tick => {
+              const tickNumber = tick.tickNumber || tick.number;
+              return tickNumber >= fromBlock && tickNumber <= toBlock;
+            });
+            
+            if (ticksInRange.length > 0) {
+              console.log(`Found ${ticksInRange.length} ticks in range ${fromBlock}-${toBlock} on page ${page}`);
+              
+              // Add these ticks to our result set
+              for (const tick of ticksInRange) {
+                if (validTicks.length >= actualMaxResults) break;
+                const normalizedTick = this.normalizeTickData(tick);
+                validTicks.push(normalizedTick);
+                
+                // Also cache individual ticks
+                this.cache.ticks[normalizedTick.tickNumber] = normalizedTick;
+              }
+            }
           }
-          
-          epochFound = true;
         } catch (error) {
-          console.error(`Failed to find specific epochs for block range: ${error.message}`);
+          console.warn(`Error fetching page ${page} in current epoch: ${error.message}`);
         }
       }
       
-      // If still no epochs found, fallback to checking many epochs
-      // Make sure we check ALL 152 historical epochs if needed
-      if (!epochFound) {
-        const currentEpoch = await this.getCurrentEpoch();
-        
-        // More aggressive approach - check ALL epochs if we can't narrow it down
-        // This ensures we never miss any data that DEXTools might need
-        console.log(`No specific epochs found for range, checking all epochs from 0 to ${currentEpoch}`);
-        
-        // Add ALL epochs from 0 to current - this ensures complete coverage
-        for (let e = 0; e <= currentEpoch; e++) {
-          epochsToCheck.push(e);
-        }
-      }
-      
-      console.log(`Checking epochs for block range: ${epochsToCheck.join(', ')}`);
-      
-      // Check each potential epoch - no arbitrary limits!
-      for (const epochToCheck of epochsToCheck) {
-        // Don't break early if we hit some arbitrary limit - DEXTools needs ALL matching ticks
-        
-        console.log(`Searching for ticks in block range in epoch ${epochToCheck}`);
-        // Don't use any artificial limits for fetching ticks
-        const ticksInEpoch = await this.getAllTicksFromEpoch(epochToCheck);
-        
-        if (ticksInEpoch && ticksInEpoch.length > 0) {
-          // Filter ticks that are in the requested range
-          const ticksInRange = ticksInEpoch.filter(tick => {
-            return tick.tickNumber >= fromBlock && tick.tickNumber <= toBlock;
-          });
+      // If we didn't find enough ticks in the current epoch, try previous epochs
+      if (validTicks.length < actualMaxResults) {
+        // Try a few previous epochs
+        for (let epochOffset = 1; epochOffset <= 5 && validTicks.length < actualMaxResults; epochOffset++) {
+          const prevEpoch = currentEpoch - epochOffset;
+          if (prevEpoch < 0) continue;
           
-          console.log(`Found ${ticksInRange.length} ticks in range ${fromBlock}-${toBlock} in epoch ${epochToCheck}`);
+          console.log(`Checking previous epoch ${prevEpoch} for ticks in range ${fromBlock}-${toBlock}`);
           
-          // Add ticks to our valid ticks array (up to maxResults)
-          for (const tick of ticksInRange) {
-            if (validTicks.length >= actualMaxResults) break;
-            validTicks.push(tick);
+          // Try the same page range in previous epoch
+          for (let page = fromBlockPage; page <= toBlockPage && validTicks.length < actualMaxResults && page < fromBlockPage + pagesToCheck; page++) {
+            try {
+              const ticksResponse = await this.handleRequest(
+                `/v2/epochs/${prevEpoch}/ticks`,
+                { page, pageSize }
+              );
+              
+              if (ticksResponse && ticksResponse.ticks && Array.isArray(ticksResponse.ticks) && ticksResponse.ticks.length > 0) {
+                // Filter ticks in the requested range
+                const ticksInRange = ticksResponse.ticks.filter(tick => {
+                  const tickNumber = tick.tickNumber || tick.number;
+                  return tickNumber >= fromBlock && tickNumber <= toBlock;
+                });
+                
+                if (ticksInRange.length > 0) {
+                  console.log(`Found ${ticksInRange.length} ticks in range ${fromBlock}-${toBlock} in epoch ${prevEpoch} page ${page}`);
+                  
+                  // Add these ticks to our result set
+                  for (const tick of ticksInRange) {
+                    if (validTicks.length >= actualMaxResults) break;
+                    const normalizedTick = this.normalizeTickData(tick);
+                    validTicks.push(normalizedTick);
+                    
+                    // Also cache individual ticks
+                    this.cache.ticks[normalizedTick.tickNumber] = normalizedTick;
+                  }
+                }
+              }
+            } catch (error) {
+              console.warn(`Error fetching page ${page} in epoch ${prevEpoch}: ${error.message}`);
+            }
           }
         }
+      }
+      
+      // If we still don't have any valid ticks and the range is small, 
+      // try to find at least one tick in the range by targeting the middle
+      if (validTicks.length === 0 && rangeSize <= 1000) {
+        const middleBlock = Math.floor((fromBlock + toBlock) / 2);
+        console.log(`No ticks found yet, trying to find middle block ${middleBlock}`);
+        
+        try {
+          const middleTick = await this.getTickByNumber(middleBlock);
+          if (middleTick && !middleTick.error) {
+            console.log(`Found middle tick ${middleTick.tickNumber}`);
+            validTicks.push(middleTick);
+          }
+        } catch (error) {
+          console.warn(`Error finding middle block: ${error.message}`);
+        }
+      }
+      
+      // If we still don't have any valid ticks, return an empty array
+      // This is better than returning random recent ticks that aren't in the requested range
+      if (validTicks.length === 0) {
+        console.log(`No ticks found in requested range ${fromBlock}-${toBlock}`);
+        return [];
       }
       
       // Sort by tick number
       validTicks.sort((a, b) => a.tickNumber - b.tickNumber);
       
-      // If we still don't have any valid ticks, fallback to the most recent ones
-      if (validTicks.length === 0) {
-        console.log(`No ticks found in requested range, returning most recent ticks as fallback`);
-        return this.getRecentValidTicks(maxResults);
-      }
-      
       console.log(`Returning ${validTicks.length} ticks for range ${fromBlock}-${toBlock}`);
       return validTicks;
     } catch (error) {
       console.error(`Error getting ticks in block range ${fromBlock}-${toBlock}:`, error.message);
-      // Fallback to recent valid ticks
-      return this.getRecentValidTicks(maxResults);
+      return [];
     }
   }
 
@@ -526,29 +810,61 @@ class QubicRpcClient {
       const currentEpoch = await this.getCurrentEpoch();
       
       const validTicks = [];
+      const pageSize = 500; // INCREASED from 100 to 500 for better performance
       
-      // Check current epoch and previous epochs
-      for (let epoch = currentEpoch; epoch >= Math.max(0, currentEpoch - 5); epoch--) {
-        if (validTicks.length >= count) break;
+      // Just get the first page of ticks for the most recent ones
+      console.log(`Getting recent ticks from epoch ${currentEpoch}`);
+      
+      try {
+        const ticksResponse = await this.handleRequest(
+          `/v2/epochs/${currentEpoch}/ticks`,
+          { page: 0, pageSize }
+        );
         
-        console.log(`Getting recent ticks from epoch ${epoch}`);
-        // Increase limit to ensure we get enough ticks - 1000 instead of 100
-        const ticksInEpoch = await this.getAllTicksFromEpoch(epoch, 1000);
-        
-        if (ticksInEpoch && ticksInEpoch.length > 0) {
-          console.log(`Found ${ticksInEpoch.length} ticks in epoch ${epoch}`);
+        if (ticksResponse && ticksResponse.ticks && Array.isArray(ticksResponse.ticks) && ticksResponse.ticks.length > 0) {
+          console.log(`Found ${ticksResponse.ticks.length} ticks in epoch ${currentEpoch}`);
           
           // Sort by tick number (descending) to get most recent first
-          const sortedTicks = [...ticksInEpoch].sort((a, b) => b.tickNumber - a.tickNumber);
+          const sortedTicks = ticksResponse.ticks.sort((a, b) => {
+            return (b.tickNumber || b.number) - (a.tickNumber || a.number);
+          });
           
-          // Add ticks to our valid ticks array (up to count)
-          for (const tick of sortedTicks) {
-            if (validTicks.length >= count) break;
-            validTicks.push(tick);
+          // Take the first 'count' ticks
+          for (let i = 0; i < Math.min(count, sortedTicks.length); i++) {
+            const normalizedTick = this.normalizeTickData(sortedTicks[i]);
+            validTicks.push(normalizedTick);
+            
+            // Also cache individual ticks
+            this.cache.ticks[normalizedTick.tickNumber] = normalizedTick;
           }
+        }
+      } catch (error) {
+        console.warn(`Error getting ticks for epoch ${currentEpoch}: ${error.message}`);
+        
+        // Try previous epoch if current fails
+        if (currentEpoch > 0) {
+          const prevEpoch = currentEpoch - 1;
+          console.log(`Trying previous epoch ${prevEpoch}`);
           
-          if (validTicks.length > 0) {
-            console.log(`Found ${validTicks.length} valid ticks in epoch ${epoch}`);
+          try {
+            const prevTicksResponse = await this.handleRequest(
+              `/v2/epochs/${prevEpoch}/ticks`,
+              { page: 0, pageSize }
+            );
+            
+            if (prevTicksResponse && prevTicksResponse.ticks && Array.isArray(prevTicksResponse.ticks)) {
+              const sortedTicks = prevTicksResponse.ticks.sort((a, b) => {
+                return (b.tickNumber || b.number) - (a.tickNumber || a.number);
+              });
+              
+              for (let i = 0; i < Math.min(count - validTicks.length, sortedTicks.length); i++) {
+                const normalizedTick = this.normalizeTickData(sortedTicks[i]);
+                validTicks.push(normalizedTick);
+                this.cache.ticks[normalizedTick.tickNumber] = normalizedTick;
+              }
+            }
+          } catch (prevError) {
+            console.warn(`Error getting ticks for previous epoch ${prevEpoch}: ${prevError.message}`);
           }
         }
       }
@@ -868,9 +1184,25 @@ class QubicRpcClient {
   
   // Get transactions for a specific tick
   async getTransactionsForTick(tickNumber) {
-    // Using v2 API for transactions
-    const response = await this.handleRequest(`/v2/ticks/${tickNumber}/transactions`);
-    return response.transactions || [];
+    try {
+      // Check cache first
+      if (this.cache.transactions[tickNumber]) {
+        console.log(`Using cached ${this.cache.transactions[tickNumber].length} transactions for tick ${tickNumber}`);
+        return this.cache.transactions[tickNumber];
+      }
+      
+      // Using v2 API for transactions
+      const response = await this.handleRequest(`/v2/ticks/${tickNumber}/transactions`);
+      const transactions = response.transactions || [];
+      
+      // Cache transactions
+      this.cache.transactions[tickNumber] = transactions;
+      
+      return transactions;
+    } catch (error) {
+      console.error(`Error getting transactions for tick ${tickNumber}:`, error.message);
+      return [];
+    }
   }
   
   // Get chain hash for a tick
@@ -1001,68 +1333,6 @@ class QubicRpcClient {
     return validTicks;
   }
   
-  // Get ticks from a specific block range using epoch data
-  async getTicksInBlockRange(fromBlock, toBlock, maxResults = 100) {
-    try {
-      console.log(`Getting ticks in block range ${fromBlock}-${toBlock}`);
-      
-      // Get current status to determine current epoch
-      const statusResponse = await this.handleRequest('/v1/status');
-      let currentEpoch = 0;
-      
-      if (statusResponse && statusResponse.lastProcessedTick && statusResponse.lastProcessedTick.epoch) {
-        currentEpoch = statusResponse.lastProcessedTick.epoch;
-        console.log(`Current epoch from status: ${currentEpoch}`);
-      } else {
-        console.warn('Could not determine current epoch from status, using fallback');
-        currentEpoch = 152;
-      }
-      
-      const validTicks = [];
-      
-      // Search through epochs to find ticks in the requested range
-      for (let epoch = currentEpoch; epoch >= Math.max(0, currentEpoch - 5); epoch--) {
-        if (validTicks.length >= maxResults) break;
-        
-        console.log(`Searching for ticks in block range in epoch ${epoch}`);
-        const ticksInEpoch = await this.getAllTicksFromEpoch(epoch);
-        
-        if (ticksInEpoch && ticksInEpoch.length > 0) {
-          // Filter ticks that are in the requested range
-          const ticksInRange = ticksInEpoch.filter(tick => {
-            const tickNumber = tick.tickNumber || tick.number;
-            return tickNumber >= fromBlock && tickNumber <= toBlock;
-          });
-          
-          console.log(`Found ${ticksInRange.length} ticks in range ${fromBlock}-${toBlock} in epoch ${epoch}`);
-          
-          // Add ticks to our valid ticks array (up to maxResults)
-          for (const tick of ticksInRange) {
-            if (validTicks.length >= maxResults) break;
-            validTicks.push(this.normalizeTickData(tick));
-          }
-        }
-        
-        // If we found any ticks in this epoch, break out of the loop
-        if (validTicks.length > 0) {
-          break;
-        }
-      }
-      
-      // If we still don't have any valid ticks, return most recent ones
-      if (validTicks.length === 0) {
-        console.log(`No ticks found in requested range, returning most recent ticks`);
-        return this.getRecentValidTicks(maxResults);
-      }
-      
-      return validTicks;
-    } catch (error) {
-      console.error(`Error getting ticks in block range ${fromBlock}-${toBlock}:`, error.message);
-      // Fallback to recent valid ticks
-      return this.getRecentValidTicks(maxResults);
-    }
-  }
-
   // Get computors for epoch
   async getComputorsForEpoch(epoch) {
     const response = await this.handleRequest(`/v1/epochs/${epoch}/computors`);

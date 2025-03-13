@@ -20,6 +20,8 @@ class BlockController {
    */
   async getLatestBlock(req, res) {
     try {
+      console.log(`Processing /latest-block request - prioritizing fast response`);
+      
       // Get the most recent valid tick with our safety buffer applied
       // The safety buffer ensures we never return a block that's too recent
       // where events might not be processed yet (crucial for DEXTools spec)
@@ -36,14 +38,16 @@ class BlockController {
       // Check if this tick has transactions/events available
       // This is CRITICAL to meet the spec requirement that all events must be available
       try {
-        const transactions = await qubicRpcClient.getTransactionsForTick(latestValidTick.tickNumber);
+        // Only fetch minimal info to check if the API endpoint for this tick is accessible
+        // We don't need to process all transactions, just verify the endpoint works
+        const checkResponse = await qubicRpcClient.client.get(`/v2/ticks/${latestValidTick.tickNumber}/transactions`, {
+          params: { page: 0, pageSize: 1 }
+        });
         
-        // Even if there are no transactions, we need to make sure the API endpoint for this tick works
-        // This confirms we can retrieve transaction data for this tick, ensuring all data is available
-        console.log(`Verified transaction data availability for tick ${latestValidTick.tickNumber}, found ${transactions?.length || 0} transactions`);
+        // If we get here, the endpoint is accessible - don't need to do anything with the response
+        console.log(`Verified transaction data availability for tick ${latestValidTick.tickNumber}`);
       } catch (error) {
-        // If we can't get transaction data for this tick, it's not safe to return it as the latest block
-        // This ensures we strictly follow the DEXTools spec about event availability
+        // If we can't access transaction data for this tick, it's not safe to return it as the latest block
         console.error(`Cannot get transaction data for tick ${latestValidTick.tickNumber}, finding earlier tick`);
         
         // Get a different tick that's definitely fully processed
@@ -52,7 +56,11 @@ class BlockController {
         // Find the first tick that has accessible transaction data
         for (const tick of saferTicks) {
           try {
-            await qubicRpcClient.getTransactionsForTick(tick.tickNumber);
+            // Again, just check API accessibility with minimal data
+            await qubicRpcClient.client.get(`/v2/ticks/${tick.tickNumber}/transactions`, {
+              params: { page: 0, pageSize: 1 }
+            });
+            
             console.log(`Found alternative safe tick ${tick.tickNumber} with accessible transaction data`);
             // Use this tick instead since we verified transaction data is available
             return res.json({ block: dataTransformer.transformTickToBlock(tick) });

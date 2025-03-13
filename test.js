@@ -147,6 +147,39 @@ async function testAllEndpoints() {
   console.log('\n=== DEXTools Adapter Testing Complete ===');
 }
 
+async function testAdapter() {
+  try {
+    console.log("1. Testing /latest-block endpoint...");
+    const latestBlock = await axios.get("http://localhost:3000/latest-block");
+    console.log("  Latest block:", latestBlock.data);
+    
+    console.log("\n2. Testing /block endpoint with historical block...");
+    const historicalBlock = await axios.get("http://localhost:3000/block?number=15000000");
+    console.log("  Historical block:", historicalBlock.data);
+    
+    console.log("\n3. Testing /events with small range...");
+    const recentEvents = await axios.get("http://localhost:3000/events?fromBlock=21265000&toBlock=21265010");
+    console.log(`  Found ${recentEvents.data.events?.length || 0} events`);
+    
+    console.log("\n4. Testing cross-epoch block range...");
+    // Using a larger range that might cross epochs
+    const crossEpochEvents = await axios.get("http://localhost:3000/events?fromBlock=21000000&toBlock=21000100");
+    console.log(`  Found ${crossEpochEvents.data.events?.length || 0} events across potential epoch boundary`);
+    
+    console.log("\n5. Testing individual block retrieval...");
+    const singleBlock = await axios.get("http://localhost:3000/block?number=21265000");
+    console.log("  Block data:", singleBlock.data);
+    
+    console.log("\nAll tests completed successfully!");
+  } catch (error) {
+    console.error("Test failed:", error.message);
+    if (error.response) {
+      console.error("Response data:", error.response.data);
+      console.error("Response status:", error.response.status);
+    }
+  }
+}
+
 // Main
 (async () => {
   if (await isAdapterRunning()) {
@@ -157,4 +190,6 @@ async function testAllEndpoints() {
     console.log('  npm start\n');
     console.log('In a separate terminal, then run this test again.');
   }
-})(); 
+})();
+
+testAdapter(); 
