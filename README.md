@@ -88,28 +88,35 @@ Qubic has a unique blockchain structure that requires special handling:
    - The DEXTools specification requires that all events must be available at the time a block is reported
    - If any events are missed due to tick unavailability, they'll never be indexed by DEXTools
    - This makes complete historical coverage of all ticks essential
+   - DEXTools indexes "as fast as possible," so recent ticks must be prioritized for performance
 
 ### Implementation Strategies
 
 The adapter implements comprehensive strategies to ensure complete coverage of Qubic's data:
 
-1. **Epoch-Based Approach**:
+1. **Prioritized Recent Tick Access**:
+   - Optimizes for the latest ticks in the current epoch, which DEXTools needs for real-time indexing
+   - Implements caching that prioritizes the current epoch's data for faster access
+   - Uses a smaller safety buffer for recent ticks to minimize indexing delay
+   - This allows DEXTools to index new blocks "as fast as possible" as specified in the requirements
+
+2. **Epoch-Based Approach**:
    - Instead of fetching individual ticks, we retrieve ticks in bulk from epoch endpoints
    - The `/v2/epochs/{epoch}/ticks` endpoint provides much higher reliability than individual tick endpoints
    - This approach bypasses the ~10% failure rate of individual tick endpoints
    - Ensures we don't miss any ticks due to network issues or empty responses
 
-2. **Complete Historical Access**:
+3. **Complete Historical Access**:
    - Retrieves all ticks from any epoch with no artificial limits on tick count
    - Implements efficient pagination and caching to handle millions of ticks
    - Uses a progressive epoch search algorithm to find ticks in any of the 152+ historical epochs
 
-2. **DEXTools-Required Safety Measures**:
+4. **DEXTools-Required Safety Measures**:
    - For `/latest-block`, applies a safety buffer and verifies event availability before returning
    - For block searches, implements fallbacks to find valid ticks if the specific one is empty
    - Ensures complete event coverage for any requested block range
 
-3. **Efficient Range Processing**:
+5. **Efficient Range Processing**:
    - When DEXTools requests the `/events` endpoint for a range of blocks, scans all relevant epochs
    - Returns all events from every valid tick in the requested range
    - Sorts events by block number and event index as required by the specification
